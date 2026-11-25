@@ -1,0 +1,194 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+# ==============================================================================
+# PROJETO: Debian Custom RootFS para Termux (100% CLI)
+# OBJETIVO: Construir um sistema Debian mínimo do zero usando debootstrap + proot
+# ==============================================================================
+
+set -e # Interrompe o script se algum comando retornar erro
+
+# --- 1. CONFIGURAÇÕES E VARIÁVEIS ---
+DISTRO_NAME="debian-custom"
+RELEASE="bookworm" # Debian 12 (Stable)
+INSTALL_DIR="$HOME/$DISTRO_NAME"
+LAUNCHER="$PREFIX/bin/$DISTRO_NAME"
+MIRROR="http://deb.debian.org/debian/"
+# Pacotes extras além do minbase (minbase não traz certificados, editor nem locales)
+EXTRA_PKGS="ca-certificates,nano,less,locales"
+
+# --- 2. DETECÇÃO DE ARQUITETURA ---
+detect_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        aarch64|arm64) echo "arm64" ;;
+        armv7l|armv8l) echo "armhf" ;;
+        x86_64)        echo "amd64" ;;
+        i686|i386)     echo "i386" ;;
+        *)
+            echo "[ERRO] Arquitetura não suportada: $arch" >&2
+            exit 1
+            ;;
+    esac
+}
+
+TARGET_ARCH=$(detect_arch)
+
+echo "=========================================="
+echo " Iniciando build do Debian ($RELEASE)"
+echo " Arquitetura detectada: $TARGET_ARCH"
+echo " Diretório alvo: $INSTALL_DIR"
+echo "=========================================="
+
+# --- 3. DEPENDÊNCIAS DO HOST (TERMUX) ---
+echo "[1/5] Verificando dependências no Termux..."
+pkg update -y
+pkg install -y proot debootstrap
+
+# --- 4. CONSTRUÇÃO DO ROOTFS (BOOTSTRAP) ---
+reset_install_dir() {
+    chmod -R 755 "$INSTALL_DIR" 2>/dev/null || true
+    rm -rf "$INSTALL_DIR"
+    mkdir -p "$INSTALL_DIR"
+}
+
+if [ -d "$INSTALL_DIR" ]; then
+    echo "[AVISO] O diretório $INSTALL_DIR já existe."
+    read -r -p "Deseja apagar e reconstruir do zero? (s/N): " confirm
+    if [[ "$confirm" =~ ^[Ss]$ ]]; then
+        reset_install_dir
+    else
+        echo "Abortando instalação."
+        exit 0
+    fi
+else
+    mkdir -p "$INSTALL_DIR"
+fi
+
+run_debootstrap() {
+    debootstrap --arch="$TARGET_ARCH" --variant=minbase \
+        --include="$EXTRA_PKGS" "$@" \
+        "$RELEASE" "$INSTALL_DIR" "$MIRROR"
+}
+
+echo "[2/5] Baixando e extraindo pacotes base do Debian (debootstrap)..."
+if ! run_debootstrap; then
+    echo "[ERRO] O debootstrap falhou."
+    echo "Se o erro foi de chave GPG/keyring, dá para tentar de novo sem verificar"
+    echo "as assinaturas (menos seguro)."
+    read -r -p "Tentar novamente com --no-check-gpg? (s/N): " retry
+    if [[ "$retry" =~ ^[Ss]$ ]]; then
+        reset_install_dir
+        run_debootstrap --no-check-gpg
+    else
+        exit 1
+    fi
+fi
+
+# --- 5. CONFIGURAÇÕES PÓS-INSTALAÇÃO NO ROOTFS ---
+echo "[3/5] Configurando DNS, repositórios e ambiente..."
+
+# DNS estático (evita falha de resolução de nomes dentro do proot)
+cat << 'EOF' > "$INSTALL_DIR/etc/resolv.conf"
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF
+
+# Hosts mínimo (evita avisos de "unable to resolve host")
+cat << 'EOF' > "$INSTALL_DIR/etc/hosts"
+127.0.0.1 localhost
+::1       localhost
+EOF
+
+# sources.list padrão
+cat << EOF > "$INSTALL_DIR/etc/apt/sources.list"
+deb $MIRROR $RELEASE main contrib non-free non-free-firmware
+deb $MIRROR $RELEASE-updates main contrib non-free non-free-firmware
+deb http://security.debian.org/debian-security $RELEASE-security main contrib non-free non-free-firmware
+EOF
+
+# Dentro do proot o apt não consegue trocar para o usuário _apt (setgroups falha).
+# Rodar o sandbox como root resolve.
+mkdir -p "$INSTALL_DIR/etc/apt/apt.conf.d"
+echo 'APT::Sandbox::User "root";' > "$INSTALL_DIR/etc/apt/apt.conf.d/01-proot"
+
+# Prompt personalizado (PS1) para identificar o ambiente
+cat << 'EOF' >> "$INSTALL_DIR/root/.bashrc"
+export PS1='\[\033[01;31m\][debian-cli]\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+export TERM="${TERM:-xterm-256color}"
+export LANG=C.UTF-8
+EOF
+
+# Garante que o .bashrc seja lido em shells de login (bash --login)
+cat << 'EOF' > "$INSTALL_DIR/root/.bash_profile"
+[ -f ~/.bashrc ] && . ~/.bashrc
+EOF
+
+# Arquivos falsos de /proc (Android 8+ bloqueia /proc/stat, /proc/uptime etc.)
+# O launcher só usa estes arquivos se o /proc real estiver bloqueado.
+mkdir -p "$INSTALL_DIR/proc"
+echo "0.12 0.07 0.02 2/165 765" > "$INSTALL_DIR/proc/.loadavg"
+echo "124.08 932.80" > "$INSTALL_DIR/proc/.uptime"
+cat << 'EOF' > "$INSTALL_DIR/proc/.stat"
+cpu  1957 0 2877 93280 262 342 254 87 0 0
+cpu0 1957 0 2877 93280 262 342 254 87 0 0
+ctxt 140000
+btime 1700000000
+processes 1500
+procs_running 1
+procs_blocked 0
+EOF
+
+# --- 6. CRIAÇÃO DO EXECUTÁVEL (LAUNCHER) ---
+echo "[4/5] Gerando script de inicialização em $LAUNCHER..."
+
+# Cabeçalho com os valores resolvidos agora (sem problemas de escape)
+{
+    echo '#!/data/data/com.termux/files/usr/bin/bash'
+    echo "ROOTFS=\"$INSTALL_DIR\""
+    echo "TMP_HOST=\"$PREFIX/tmp\""
+    echo "SHARED_HOST=\"$HOME/storage/shared\""
+} > "$LAUNCHER"
+
+# Corpo do launcher (heredoc entre aspas: nada é expandido aqui)
+cat << 'EOF' >> "$LAUNCHER"
+unset LD_PRELOAD
+
+mkdir -p "$TMP_HOST"
+
+BINDS=(-b /dev -b /proc -b /sys -b "$TMP_HOST:/tmp")
+
+# Armazenamento compartilhado do Android (requer: termux-setup-storage).
+# Não montamos o $HOME inteiro para evitar que o rootfs enxergue a si mesmo.
+if [ -d "$SHARED_HOST" ]; then
+    BINDS+=(-b "$SHARED_HOST:/root/sdcard")
+fi
+
+# Se o /proc real estiver bloqueado, usa os arquivos falsos
+if ! cat /proc/stat >/dev/null 2>&1; then
+    for f in loadavg stat uptime; do
+        [ -f "$ROOTFS/proc/.$f" ] && BINDS+=(-b "$ROOTFS/proc/.$f:/proc/$f")
+    done
+fi
+
+exec proot \
+    --link2symlink \
+    --kill-on-exit \
+    -0 \
+    -r "$ROOTFS" \
+    "${BINDS[@]}" \
+    -w /root \
+    /usr/bin/env -i \
+    HOME=/root \
+    PATH=/usr/local/sbin:/usr/local/bin:/bin:/usr/bin:/sbin:/usr/sbin \
+    TERM="${TERM:-xterm-256color}" \
+    LANG=C.UTF-8 \
+    /bin/bash --login
+EOF
+
+chmod +x "$LAUNCHER"
+
+# --- 7. FINALIZAÇÃO ---
+echo "[5/5] Concluído!"
+echo "Para iniciar seu sistema Debian CLI, digite: $DISTRO_NAME"
+echo "Dica: rode 'termux-setup-storage' para liberar /root/sdcard dentro do Debian."
